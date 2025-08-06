@@ -4,6 +4,7 @@ allow_prints=True
 allow_benchmarking=False  #Dont allow printing while benchmarking
 debug_mode=False #Use button
 
+pin='1234'
 ############################### Benchmarking #################################
 from datetime import datetime
 import json
@@ -23,8 +24,10 @@ import os
 import uuid
 import cbor2
 from hashlib import sha256
+import hmac
 
 file_path="/etc/fido2_security_key/keys.secret"
+pin_file_path="/etc/fido2_security_key/pin.secret"
 
 current_keys={}
 algo=-7
@@ -48,6 +51,25 @@ while True:
 
 print('Keys loaded')
 
+while True:
+    print("Reading pin file")
+    try:
+        if not os.path.exists(pin_file_path):
+            empty_keys={}
+            with open(pin_file_path,'wb') as file:
+                
+                file.write(pin.encode())
+
+
+        with open(pin_file_path,'rb') as file:
+            pin=file.read().decode()
+            
+
+        break
+    except:
+        pass
+
+print('Pin loaded')
 
 def get_algo(pubkeycredparams):
     for param in pubkeycredparams:
@@ -124,6 +146,9 @@ def get_cred_entity(rpid, cred_id):
 
 def hash_data(data):
     return sha256(data).digest()
+
+def hmac_sha(x, y):
+    return hmac.new(x, y, sha256).digest()[0:16]
 ############################### Cryptographic Operations ECDSA ######################
 from ecdsa import SigningKey, VerifyingKey, NIST256p
 from cryptography import x509 
@@ -132,6 +157,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, NoEncryption
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.serialization import load_der_private_key
 from cryptography.hazmat.backends import default_backend
 import datetime
@@ -205,6 +231,28 @@ def gen_certificate_ecdsa(pvtkey):
     cert_der = certificate.public_bytes(serialization.Encoding.DER)
     return cert_der
 
+def aes_decrypt(aeskey, ciphertext):
+    iv=b'\x00'*16
+    cipher=Cipher(
+        algorithms.AES(aeskey),
+        modes.CBC(iv)
+    )
+    decryptor=cipher.decryptor()
+    decrypted=decryptor.update(ciphertext) + decryptor.finalize()
+    return decrypted
+
+def aes_encrypt(aeskey, plaintext):
+    iv=b'\x00'*16
+    cipher=Cipher(
+        algorithms.AES(aeskey),
+        modes.CBC(iv)
+    )
+    encryptor=cipher.encryptor()
+    encrypted=encryptor.update(plaintext)+encryptor.finalize()
+    return encrypted
+
+
+
 ############################### Cryptographic Operations ML-DSA ######################
 import oqs
 
@@ -247,24 +295,36 @@ def authenticatorGetInfo():
     options={}
     options['rk']=True
     options['plat']=False
+    options['clientPin']=True
     options['up']=True
     options['uv']=True
     authenticatorInfo[4]=options
     authenticatorInfo[5]=1200
     authenticatorInfo[6]=[1]
-    authenticatorInfo[7]=8
-    authenticatorInfo[8]=128
-    authenticatorInfo[9]=['usb']
-    authenticatorInfo[10]=[{'alg': -7, 'type': 'public-key'},{'alg': -48, 'type': 'public-key'},{'alg': -49, 'type': 'public-key'}]
+    #authenticatorInfo[7]=8
+    #authenticatorInfo[8]=128
+    #authenticatorInfo[9]=['usb']
+    #authenticatorInfo[10]=[{'alg': -7, 'type': 'public-key'},{'alg': -48, 'type': 'public-key'},{'alg': -49, 'type': 'public-key'}]
     return authenticatorInfo, 0
+
 
 def authenticatorMakeCredential(channel, payload):
     global algo
+    global pintoken
     wait_user_input(channel)
     clientDataHash=payload[1]
     rp=payload[2]
     user=payload[3]
     pubKeyCredParams=payload[4]
+    if 8 in payload:
+        pinAuth=payload[8]
+
+        pinauthvalid=hmac_sha(pintoken, clientDataHash)
+        show(pinauthvalid, 'Expected hash')
+        show(pinAuth, 'received hash')
+        if pinauthvalid != pinAuth:
+            return '', 0x33
+
 
     algo=get_algo(pubKeyCredParams)
     userid=user['id']
@@ -277,7 +337,8 @@ def authenticatorMakeCredential(channel, payload):
             if check_key_entity_exists(rpid, exclude):
                 return '', 0x19
     
-
+    if 8 not in payload:
+        return '', 0x36
     
     rpidhash=hash_data(rpid.encode())
     
@@ -310,6 +371,7 @@ def authenticatorMakeCredential(channel, payload):
 
     return attestationobj, 0
 
+
 signatures=[]
 
 
@@ -317,13 +379,21 @@ assertptr=0
 assertiontime=0
 
 def authenticatorGetAssertion(channel, payload):
-    global signatures, assertiontime, assertptr, algo
+    global signatures, assertiontime, assertptr, algo, pintoken, secret
     
     signatures=[]
     signkeys=[]
     signum=0
     rpid=payload[1]
     clientDataHash=payload[2]
+
+    if 6 in payload:
+        pinAuth=payload[6]
+
+        pinauthvalid=hmac_sha(pintoken, clientDataHash)
+        if pinauthvalid != pinAuth:
+            return '', 0x33
+
     allowList=[]
     if 3 in payload:
         allowList=payload[3]
@@ -341,11 +411,19 @@ def authenticatorGetAssertion(channel, payload):
         for key in all_keys:
             allowList.append(all_keys[key]['publickeyentity'])
 
+            
+
     else:
         finlist=[]
         for cred in allowList:
             if check_key_entity_exists(rpid, cred):
                 finlist.append(cred)
+            try:
+                keydec=aes_decrypt(secret, cred)
+                if check_key_entity_exists(rpid, keydec):
+                    finlist.append(keydec)
+            except:
+                pass
         allowList=finlist
 
     numberOfCredentials=len(allowList)
@@ -354,6 +432,9 @@ def authenticatorGetAssertion(channel, payload):
         assertptr=0
         assertiontime=0
         return '', 0x2e
+
+    if 6 not in payload:
+        return '', 0x36
 
     c=0
     for cred in allowList:
@@ -379,6 +460,7 @@ def authenticatorGetAssertion(channel, payload):
     wait_user_input(channel)
     return signatures[0],0
 
+
 def authenticatorGetNextAssertion():
     global signatures, assertiontime, assertptr
     if assertptr==0 or assertptr>len(signatures) or int(time.time())-assertiontime>30 :
@@ -391,6 +473,111 @@ def authenticatorGetNextAssertion():
     sig=signatures[assertptr]
     assertptr=assertptr+1
     return sig, 0
+
+retries=8
+
+def getRetries():
+    global retries
+    return {3: retries},0
+
+a=None
+aG=None
+bG=None
+secret=b''
+
+
+def getKeyAgreement():
+    global a
+    global aG
+    
+    a_ob=ec.generate_private_key(ec.SECP256R1())
+    aG_ob=a_ob.public_key()
+    public_bytes=aG_ob.public_bytes(
+        encoding=serialization.Encoding.X962,
+        format=serialization.PublicFormat.UncompressedPoint
+    )
+    x=public_bytes[1:33]
+    y=public_bytes[33:65]
+    cose_key={1:2, 3:-25, -1:1, -2:x, -3:y}
+    a=a_ob
+    aG=aG_ob
+    return {1: cose_key},0
+
+
+pintoken=b''
+def getPINToken(channel, payload):
+    global a
+    global pintoken
+    global secret
+    pubkey=payload[3]
+    uncompressed=b'\x04'+pubkey[-2]+pubkey[-3]
+    pubkey_ob=ec.EllipticCurvePublicKey.from_encoded_point(
+        ec.SECP256R1(), uncompressed
+    )
+
+    shared_key=a.exchange(ec.ECDH(), pubkey_ob)
+
+    secret=hash_data(shared_key)
+    show(secret, 'AES Key')
+
+    expectedpin=hash_data(pin.encode())[:16]
+    receivedpin=aes_decrypt(secret, payload[6])
+
+    if expectedpin==receivedpin:
+        pintoken=os.urandom(16)
+        encpintoken=aes_encrypt(secret, pintoken)
+        return {2: encpintoken}, 0
+    return '',0x31
+
+def changePin(channel, payload):
+    global a
+    global pintoken
+    global secret
+    global pin
+    pubkey=payload[3]
+    uncompressed=b'\x04'+pubkey[-2]+pubkey[-3]
+    pubkey_ob=ec.EllipticCurvePublicKey.from_encoded_point(
+        ec.SECP256R1(), uncompressed
+    )
+
+    shared_key=a.exchange(ec.ECDH(), pubkey_ob)
+    secret=hash_data(shared_key)
+    pinHashEnc=payload[6]
+    newPinEnc=payload[5]
+    pinAuth=payload[4]
+    expectedPinAuth=hmac_sha(secret, newPinEnc+pinHashEnc)
+    if expectedPinAuth != pinAuth:
+        return '', 0x33
+
+    pinHash=aes_decrypt(secret, pinHashEnc)
+    if pinHash!=hash_data(pin.encode())[:16]:
+        return '', 0x31
+    
+    newPin=aes_decrypt(secret, newPinEnc)
+    newPin=newPin.rstrip(b'\x00')
+    print('NEW PIN')
+    print(newPin.decode())
+    pin=newPin.decode()
+
+    with open(pin_file_path,'wb') as file:
+        file.write(pin.encode())
+
+    return b'',0
+
+def authenticatorClientPin(channel, payload):
+    pinProtocol=payload[1]
+    subCommand=payload[2]
+    if subCommand==0x01:
+        resp, code= getRetries()
+    if subCommand==0x02:
+        resp, code= getKeyAgreement()
+    if subCommand==0x05:
+        resp, code= getPINToken(channel, payload)
+    if subCommand==0x04:
+        resp, code=changePin(channel, payload)
+
+    return resp, code
+
 
 import os
 def authenticatorReset():
@@ -409,6 +596,7 @@ def CTAPHID_CBOR(channel, payload):
     show(cbor_command_bytes, 'CBOR Command')
     cbor_payload=payload[1:]
     success=0
+    show(cbor_payload, 'CBOR payload')
     if cbor_command==0x04:
         reply_payload, success=authenticatorGetInfo()
     if cbor_command==0x01:
@@ -419,6 +607,8 @@ def CTAPHID_CBOR(channel, payload):
         reply_payload, success=authenticatorGetNextAssertion()
     if cbor_command==0x07:
         reply_payload, success=authenticatorReset()
+    if cbor_command==0x06:
+        reply_payload, success=authenticatorClientPin(channel, cbor2.loads(cbor_payload))
 
     if success==0:
         reply=(0).to_bytes(1,'big')
@@ -427,7 +617,7 @@ def CTAPHID_CBOR(channel, payload):
         to_send=preprocess_send_data(channel, command, bcnt, reply)
         return (to_send)
     else:
-        reply=success.to_bytes(1,'big')
+        reply=b'\x01'+success.to_bytes(1,'big')
         bcnt=len(reply)
         to_send=preprocess_send_data(channel, command, bcnt, reply)
         return (to_send)
@@ -609,10 +799,11 @@ def process_packet(packet):
         full_data[cstr][seqnum]=payload
     except:
         pass
-    try:
-        process_transcation(channel)
-    except:
-        CTAPHID_ERROR(channel)
+    #try:
+    process_transcation(channel)
+    #except Exception as e:
+    #    print(e)
+    #    CTAPHID_ERROR(channel)
 
 
 
@@ -787,4 +978,3 @@ if __name__=='__main__':
             continue
         show(packet, 'Full packet')
         process_packet(packet)
-
